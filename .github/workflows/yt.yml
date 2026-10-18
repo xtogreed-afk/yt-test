@@ -1,15 +1,54 @@
-name: yt-test
-on: workflow_dispatch
+name: yt
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        required: true
+      chat:
+        required: true
+      msg:
+        required: false
 jobs:
-  test:
+  dl:
     runs-on: ubuntu-latest
+    env:
+      URL: ${{ inputs.url }}
+      CHAT: ${{ inputs.chat }}
+      MSG: ${{ inputs.msg }}
+      BOT: ${{ secrets.BOT_TOKEN }}
     steps:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
       - run: pip install -U yt-dlp
-      - env:
+      - name: download
+        env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
+          set -e
+          [[ "$URL" =~ ^https://(www\.|m\.)?(youtube\.com|youtu\.be)/ ]] || { echo bad url; exit 1; }
+          [[ "$CHAT" =~ ^-?[0-9]+$ ]] || exit 1
           printf '%s' "$YT_COOKIES" > cookies.txt
-          yt-dlp --cookies cookies.txt --remote-components ejs:github -F "https://youtu.be/Nxmi2z9uUCM"
+          for H in 720 480 360; do
+            rm -f out.mp4
+            yt-dlp --cookies cookies.txt --remote-components ejs:github --no-playlist \
+              -f "bv*[height<=$H][vcodec^=avc1]+ba[ext=m4a]/b[height<=$H][ext=mp4]/bv*[height<=$H]+ba/b[height<=$H]" \
+              --merge-output-format mp4 -o out.mp4 "$URL" || continue
+            [ "$(stat -c%s out.mp4)" -le 49000000 ] && break
+            rm -f out.mp4
+          done
+          [ -f out.mp4 ]
+      - name: send
+        run: |
+          curl -sS -f -F chat_id="$CHAT" -F supports_streaming=true -F video=@out.mp4 \
+            "https://api.telegram.org/bot$BOT/sendVideo"
+      - name: report error
+        if: failure()
+        run: |
+          curl -sS -F chat_id="$CHAT" -F text="Не получилось скачать с YouTube" \
+            "https://api.telegram.org/bot$BOT/sendMessage"
+      - name: cleanup
+        if: always()
+        run: |
+          [ -n "$MSG" ] && curl -sS -F chat_id="$CHAT" -F message_id="$MSG" \
+            "https://api.telegram.org/bot$BOT/deleteMessage" || true
