@@ -1,0 +1,8 @@
+name: yt-test
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install -U yt-dlp
+      - run: yt-dlp -F "https://youtu.be/Nxmi2z9uUCM"
