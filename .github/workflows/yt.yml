@@ -12,4 +12,4 @@ jobs:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
           printf '%s' "$YT_COOKIES" > cookies.txt
-          yt-dlp --cookies cookies.txt -F "https://youtu.be/Nxmi2z9uUCM"
+          yt-dlp --cookies cookies.txt --remote-components ejs:github -F "https://youtu.be/Nxmi2z9uUCM"
