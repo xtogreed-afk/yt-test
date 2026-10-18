@@ -4,5 +4,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - run: pip install -U yt-dlp
-      - run: yt-dlp -F "https://youtu.be/Nxmi2z9uUCM"
+      - env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          printf '%s' "$YT_COOKIES" > cookies.txt
+          yt-dlp --cookies cookies.txt -F "https://youtu.be/Nxmi2z9uUCM"
