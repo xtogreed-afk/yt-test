@@ -22,11 +22,8 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - name: install tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
-          pip install -U yt-dlp telethon cryptg
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+      - run: pip install -U yt-dlp telethon cryptg
       - name: download
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
@@ -35,10 +32,11 @@ jobs:
           [[ "$URL" =~ ^https://(www\.|m\.)?(youtube\.com|youtu\.be)/ ]] || { echo bad url; exit 1; }
           [[ "$CHAT" =~ ^-?[0-9]+$ ]] || exit 1
           printf '%s' "$YT_COOKIES" > cookies.txt
-          for H in 1080 720 480 360 240 144; do
+          for H in 720 480 360 240 144; do
+            echo "== $(date +%T) пробую до ${H}p"
             rm -f out.mp4
             yt-dlp --cookies cookies.txt --remote-components ejs:github --no-playlist \
-              -N 4 --max-filesize 1900M \
+              -N 8 --max-filesize 1900M \
               -f "bv*[height<=$H][vcodec^=avc1]+ba[ext=m4a]/b[height<=$H][ext=mp4]/bv*[height<=$H]+ba/b[height<=$H]" \
               --merge-output-format mp4 -o out.mp4 "$URL" || continue
             [ -f out.mp4 ] || continue
@@ -46,21 +44,25 @@ jobs:
             rm -f out.mp4
           done
           [ -f out.mp4 ]
+          echo "== $(date +%T) готово: $(stat -c%s out.mp4) байт"
+          ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,bit_rate:format=duration -of default=nw=1 out.mp4
       - name: send
         env:
           API_ID: ${{ secrets.TG_API_ID }}
           API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
+          echo "== $(date +%T) отправка"
           if [ "$(stat -c%s out.mp4)" -le 49000000 ]; then
             curl -sS -f -F chat_id="$CHAT" -F supports_streaming=true -F video=@out.mp4 \
               "https://api.telegram.org/bot$BOT/sendVideo"
           else
             python3 upload.py out.mp4
           fi
+          echo "== $(date +%T) отправлено"
       - name: report error
         if: failure()
         run: |
-          curl -sS -F chat_id="$CHAT" -F text="Не получилось скачать с YouTube (возможно, видео длиннее ~2 ГБ даже в 144p)" \
+          curl -sS -F chat_id="$CHAT" -F text="Не получилось скачать с YouTube (возможно, видео слишком длинное даже в 144p)" \
             "https://api.telegram.org/bot$BOT/sendMessage"
       - name: cleanup
         if: always()
