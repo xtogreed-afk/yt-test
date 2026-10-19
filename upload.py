@@ -22,34 +22,38 @@ from telethon.tl.types import (
 path = sys.argv[1]
 chat = int(os.environ["CHAT"])
 
-PART = 512 * 1024      # размер части, максимум для Telegram
-CONCURRENCY = 16       # сколько частей летит одновременно
+PART = 512 * 1024
+CONCURRENCY = 16
 
 
 def probe(p):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration",
+        "-of", "json", p,
+    ]
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height:format=duration",
-         "-of", "json", p],
-        capture_output=True, text=True, check=True,
+        cmd, capture_output=True, text=True, check=True
     ).stdout
     j = json.loads(out)
     s = (j.get("streams") or [{}])[0]
-    return int(float(j["format"]["duration"])), int(s.get("width", 0)), int(s.get("height", 0))
+    duration = int(float(j["format"]["duration"]))
+    return duration, int(s.get("width", 0)), int(s.get("height", 0))
 
 
 def make_thumb(p):
     t = "thumb.jpg"
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "1", "-i", p,
-         "-frames:v", "1", "-vf", "scale=320:-2", t],
-        check=False,
-    )
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", "1", "-i", p,
+        "-frames:v", "1", "-vf", "scale=320:-2", t,
+    ]
+    subprocess.run(cmd, check=False)
     return t if os.path.exists(t) else None
 
 
 async def fast_upload(client, p):
-    """Параллельная загрузка файла частями (SaveBigFilePart)."""
     size = os.path.getsize(p)
     total = (size + PART - 1) // PART
     file_id = random.randrange(-2**63, 2**63)
@@ -60,11 +64,13 @@ async def fast_upload(client, p):
         try:
             for attempt in range(6):
                 try:
-                    await client(SaveBigFilePartRequest(file_id, i, total, data))
+                    req = SaveBigFilePartRequest(file_id, i, total, data)
+                    await client(req)
                     break
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds + 1)
-                except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
+                except (RPCError, ConnectionError,
+                        asyncio.TimeoutError, OSError):
                     if attempt == 5:
                         raise
                     await asyncio.sleep(2 ** attempt)
@@ -73,8 +79,8 @@ async def fast_upload(client, p):
             if pct - state["last"] >= 10:
                 state["last"] = pct
                 mb = state["done"] * PART / 1e6
-                speed = mb / max(time.time() - state["t0"], 0.001)
-                print(f"upload {pct}%  {speed:.1f} MB/s", flush=True)
+                dt = max(time.time() - state["t0"], 0.001)
+                print(f"upload {pct}%  {mb / dt:.1f} MB/s", flush=True)
         finally:
             sem.release()
 
@@ -91,6 +97,60 @@ async def fast_upload(client, p):
 async def main():
     duration, w, h = probe(path)
     thumb = make_thumb(path)
-    print(f"video: {w}x{h}, {duration}s, {os.path.getsize(path) / 1e6:.1f} MB", flush=True)
+    mb = os.path.getsize(path) / 1e6
+    print(f"video: {w}x{h}, {duration}s, {mb:.1f} MB", flush=True)
 
-    client = TelegramClient(StringSession(), int(os.environ["API_ID"]
+    api_id = int(os.environ["API_ID"])
+    api_hash = os.environ["API_HASH"]
+    bot_token = os.environ["BOT"]
+
+    client = TelegramClient(StringSession(), api_id, api_hash)
+    await client.start(bot_token=bot_token)
+    try:
+        # у свежей сессии бота нет access_hash пользователя
+        try:
+            peer = await client.get_input_entity(chat)
+        except (ValueError, RPCError):
+            if chat <= 0:
+                raise
+            peer = InputPeerUser(chat, 0)
+
+        video_attr = DocumentAttributeVideo(
+            duration=duration, w=w, h=h, supports_streaming=True
+        )
+        attrs = [video_attr, DocumentAttributeFilename("video.mp4")]
+
+        try:
+            t0 = time.time()
+            uploaded = await fast_upload(client, path)
+            thumb_file = None
+            if thumb:
+                thumb_file = await client.upload_file(thumb)
+            media = InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type="video/mp4",
+                attributes=attrs,
+                thumb=thumb_file,
+            )
+            await client(SendMediaRequest(
+                peer=peer,
+                media=media,
+                message="",
+                random_id=random.randrange(-2**63, 2**63),
+            ))
+            print(f"sent (parallel) in {time.time() - t0:.0f} s", flush=True)
+        except Exception as e:
+            print(f"parallel upload failed: {e!r}; fallback", flush=True)
+            await client.send_file(
+                peer,
+                path,
+                thumb=thumb,
+                supports_streaming=True,
+                attributes=[video_attr],
+            )
+            print("sent (fallback)", flush=True)
+    finally:
+        await client.disconnect()
+
+
+asyncio.run(main())
