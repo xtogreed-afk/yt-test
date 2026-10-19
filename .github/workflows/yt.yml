@@ -22,8 +22,11 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - uses: FedericoCarboni/setup-ffmpeg@v3
-      - run: pip install -U yt-dlp telethon cryptg
+      - name: install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          pip install -U yt-dlp telethon cryptg
       - name: download
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
