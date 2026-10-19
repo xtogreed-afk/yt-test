@@ -1,16 +1,29 @@
 import asyncio
 import json
 import os
+import random
 import subprocess
 import sys
+import time
 
 from telethon import TelegramClient
-from telethon.errors import RPCError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeVideo, InputPeerUser
+from telethon.tl.functions.messages import SendMediaRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest
+from telethon.tl.types import (
+    DocumentAttributeFilename,
+    DocumentAttributeVideo,
+    InputFileBig,
+    InputMediaUploadedDocument,
+    InputPeerUser,
+)
 
 path = sys.argv[1]
 chat = int(os.environ["CHAT"])
+
+PART = 512 * 1024      # размер части, максимум для Telegram
+CONCURRENCY = 16       # сколько частей летит одновременно
 
 
 def probe(p):
@@ -35,41 +48,49 @@ def make_thumb(p):
     return t if os.path.exists(t) else None
 
 
+async def fast_upload(client, p):
+    """Параллельная загрузка файла частями (SaveBigFilePart)."""
+    size = os.path.getsize(p)
+    total = (size + PART - 1) // PART
+    file_id = random.randrange(-2**63, 2**63)
+    sem = asyncio.Semaphore(CONCURRENCY)
+    state = {"done": 0, "t0": time.time(), "last": -10}
+
+    async def send(i, data):
+        try:
+            for attempt in range(6):
+                try:
+                    await client(SaveBigFilePartRequest(file_id, i, total, data))
+                    break
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
+                    if attempt == 5:
+                        raise
+                    await asyncio.sleep(2 ** attempt)
+            state["done"] += 1
+            pct = state["done"] * 100 // total
+            if pct - state["last"] >= 10:
+                state["last"] = pct
+                mb = state["done"] * PART / 1e6
+                speed = mb / max(time.time() - state["t0"], 0.001)
+                print(f"upload {pct}%  {speed:.1f} MB/s", flush=True)
+        finally:
+            sem.release()
+
+    tasks = []
+    with open(p, "rb") as f:
+        for i in range(total):
+            data = f.read(PART)
+            await sem.acquire()
+            tasks.append(asyncio.create_task(send(i, data)))
+    await asyncio.gather(*tasks)
+    return InputFileBig(file_id, total, os.path.basename(p))
+
+
 async def main():
     duration, w, h = probe(path)
     thumb = make_thumb(path)
     print(f"video: {w}x{h}, {duration}s, {os.path.getsize(path) / 1e6:.1f} MB", flush=True)
 
-    client = TelegramClient(StringSession(), int(os.environ["API_ID"]), os.environ["API_HASH"])
-    await client.start(bot_token=os.environ["BOT"])
-    try:
-        # У свежей сессии бота нет access_hash пользователя — пробуем найти, иначе hash 0
-        try:
-            peer = await client.get_input_entity(chat)
-        except (ValueError, RPCError):
-            if chat <= 0:
-                raise
-            peer = InputPeerUser(chat, 0)
-
-        last = {"p": -10}
-
-        def progress(sent, total):
-            pct = int(sent * 100 / total)
-            if pct - last["p"] >= 10:
-                last["p"] = pct
-                print(f"upload {pct}%", flush=True)
-
-        await client.send_file(
-            peer,
-            path,
-            thumb=thumb,
-            supports_streaming=True,
-            attributes=[DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)],
-            progress_callback=progress,
-        )
-        print("sent", flush=True)
-    finally:
-        await client.disconnect()
-
-
-asyncio.run(main())
+    client = TelegramClient(StringSession(), int(os.environ["API_ID"]
