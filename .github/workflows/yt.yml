@@ -24,48 +24,80 @@ jobs:
           deno-version: v2.x
       - name: install tools
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends ffmpeg
-          pip install -U yt-dlp telethon cryptg
+          mkdir -p "$HOME/bin"
+          FF=https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          (curl -sSL "$FF" | tar -xJ --strip-components=2 -C "$HOME/bin" --wildcards '*/bin/ffmpeg' '*/bin/ffprobe') &
+          pip install -q -U yt-dlp gallery-dl telethon cryptg &
+          wait
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          command -v ffprobe >/dev/null || { sudo apt-get update -y; sudo apt-get install -y --no-install-recommends ffmpeg; }
+          ffmpeg -version | head -1
       - name: download
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
           set -e
-          [[ "$URL" =~ ^https://(www\.|m\.)?(youtube\.com|youtu\.be)/ ]] || { echo bad url; exit 1; }
+          RE='^https://([a-zA-Z0-9-]+\.)*(youtube\.com|youtu\.be|tiktok\.com|instagram\.com|pinterest\.[a-z.]+|pin\.it|facebook\.com|fb\.watch|fb\.com)(/|$)'
+          [[ "$URL" =~ $RE ]] || { echo bad url; exit 1; }
           [[ "$CHAT" =~ ^-?[0-9]+$ ]] || exit 1
           printf '%s' "$YT_COOKIES" > cookies.txt
           for H in 720 480 360 240 144; do
             echo "== $(date +%T) пробую до ${H}p"
             rm -f out.mp4
             yt-dlp --cookies cookies.txt --remote-components ejs:github --no-playlist \
-              -N 8 --max-filesize 1900M \
-              -f "bv*[height<=$H][vcodec^=avc1]+ba[ext=m4a]/b[height<=$H][ext=mp4]/bv*[height<=$H]+ba/b[height<=$H]" \
+              -N 16 --max-filesize 1900M \
+              -f "bv*[height<=$H][vcodec^=avc1]+ba[ext=m4a]/b[height<=$H][ext=mp4]/bv*[height<=$H]+ba/b[height<=$H]/bv*[height<=$H]+ba/b" \
               --merge-output-format mp4 -o out.mp4 "$URL" || continue
             [ -f out.mp4 ] || continue
             [ "$(stat -c%s out.mp4)" -le 2000000000 ] && break
             rm -f out.mp4
           done
-          [ -f out.mp4 ]
-          echo "== $(date +%T) готово: $(stat -c%s out.mp4) байт"
-          ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,bit_rate:format=duration -of default=nw=1 out.mp4
+          if [ -f out.mp4 ]; then
+            echo "== $(date +%T) видео: $(stat -c%s out.mp4) байт"
+            ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,bit_rate:format=duration -of default=nw=1 out.mp4
+          else
+            echo "== $(date +%T) видео нет, пробую фото (gallery-dl)"
+            gallery-dl --cookies cookies.txt -d gl --range 1-10 "$URL" || true
+            find gl -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) 2>/dev/null | sort | head -10 > photos.txt
+            [ -s photos.txt ]
+            echo "== фото: $(wc -l < photos.txt)"
+          fi
       - name: send
         env:
           API_ID: ${{ secrets.TG_API_ID }}
           API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
           echo "== $(date +%T) отправка"
-          if [ "$(stat -c%s out.mp4)" -le 49000000 ]; then
-            curl -sS -f -F chat_id="$CHAT" -F supports_streaming=true -F video=@out.mp4 \
-              "https://api.telegram.org/bot$BOT/sendVideo"
+          API="https://api.telegram.org/bot$BOT"
+          if [ -f out.mp4 ]; then
+            if [ "$(stat -c%s out.mp4)" -le 49000000 ]; then
+              curl -sS -f -F chat_id="$CHAT" -F supports_streaming=true -F video=@out.mp4 "$API/sendVideo"
+            else
+              python3 upload.py out.mp4
+            fi
           else
-            python3 upload.py out.mp4
+            N=$(wc -l < photos.txt)
+            if [ "$N" -eq 1 ]; then
+              curl -sS -f -F chat_id="$CHAT" -F photo=@"$(cat photos.txt)" "$API/sendPhoto"
+            else
+              ARGS=()
+              MEDIA='['
+              I=0
+              while read -r F; do
+                I=$((I+1))
+                ARGS+=(-F "p$I=@$F")
+                MEDIA+="{\"type\":\"photo\",\"media\":\"attach://p$I\"},"
+              done < photos.txt
+              MEDIA="${MEDIA%,}]"
+              curl -sS -f -F chat_id="$CHAT" -F media="$MEDIA" "${ARGS[@]}" "$API/sendMediaGroup"
+            fi
           fi
           echo "== $(date +%T) отправлено"
       - name: report error
         if: failure()
         run: |
-          curl -sS -F chat_id="$CHAT" -F text="Не получилось скачать с YouTube (возможно, видео слишком длинное даже в 144p)" \
+          curl -sS -F chat_id="$CHAT" -F text="Не получилось скачать (приватный пост, нужен вход или слишком большой файл)" \
             "https://api.telegram.org/bot$BOT/sendMessage"
       - name: cleanup
         if: always()
